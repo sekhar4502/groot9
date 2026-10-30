@@ -1,0 +1,854 @@
+name: Build Groot APK
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Write the Groot project files
+        run: |
+          mkdir -p app app/src/main app/src/main/java/com/groot/app app/src/main/res/values app/src/main/res/xml
+          cat > settings.gradle.kts << 'GROOT_EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "Groot"
+          include(":app")
+          GROOT_EOF
+          cat > build.gradle.kts << 'GROOT_EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          GROOT_EOF
+          cat > gradle.properties << 'GROOT_EOF'
+          org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          android.nonTransitiveRClass=true
+          kotlin.code.style=official
+          GROOT_EOF
+          cat > app/build.gradle.kts << 'GROOT_EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.groot.app"
+              compileSdk = 34
+
+              defaultConfig {
+                  applicationId = "com.groot.app"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions {
+                  jvmTarget = "17"
+              }
+          }
+          GROOT_EOF
+          cat > app/src/main/AndroidManifest.xml << 'GROOT_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.RECORD_AUDIO" />
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+              <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" />
+              <uses-permission android:name="android.permission.READ_CONTACTS" />
+              <uses-permission android:name="android.permission.CALL_PHONE" />
+
+              <queries>
+                  <intent><action android:name="android.speech.RecognitionService" /></intent>
+                  <intent><action android:name="android.intent.action.TTS_SERVICE" /></intent>
+              </queries>
+
+              <application
+                  android:allowBackup="false"
+                  android:icon="@android:drawable/ic_btn_speak_now"
+                  android:label="Groot"
+                  android:theme="@android:style/Theme.Material.Light.NoActionBar">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".WakeService"
+                      android:exported="false"
+                      android:foregroundServiceType="microphone" />
+
+                  <service
+                      android:name=".GrootAccess"
+                      android:exported="true"
+                      android:label="Groot"
+                      android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+                      <intent-filter>
+                          <action android:name="android.accessibilityservice.AccessibilityService" />
+                      </intent-filter>
+                      <meta-data
+                          android:name="android.accessibilityservice"
+                          android:resource="@xml/groot_service" />
+                  </service>
+              </application>
+          </manifest>
+          GROOT_EOF
+          cat > app/src/main/res/xml/groot_service.xml << 'GROOT_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+              android:accessibilityEventTypes="typeAllMask"
+              android:accessibilityFeedbackType="feedbackGeneric"
+              android:accessibilityFlags="flagDefault"
+              android:canRetrieveWindowContent="true"
+              android:canPerformGestures="true"
+              android:notificationTimeout="100"
+              android:description="@string/access_desc" />
+          GROOT_EOF
+          cat > app/src/main/res/values/strings.xml << 'GROOT_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <string name="app_name">Groot</string>
+              <string name="access_desc">Lets Groot tap, scroll, type and press buttons when you give a voice command.</string>
+          </resources>
+          GROOT_EOF
+          cat > app/src/main/java/com/groot/app/MainActivity.kt << 'GROOT_EOF'
+          package com.groot.app
+
+          import android.Manifest
+          import android.app.Activity
+          import android.content.Intent
+          import android.content.pm.PackageManager
+          import android.net.Uri
+          import android.os.Build
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.widget.Button
+          import android.widget.EditText
+          import android.widget.LinearLayout
+          import android.widget.ScrollView
+          import android.widget.TextView
+          import android.widget.Toast
+
+          /** Setup screen: permissions, accessibility, AI key, start / stop. */
+          class MainActivity : Activity() {
+
+              private lateinit var status: TextView
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  val prefs = getSharedPreferences("groot", MODE_PRIVATE)
+                  val box = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(40, 60, 40, 60)
+                  }
+
+                  fun label(s: String, size: Float = 15f): TextView {
+                      val t = TextView(this)
+                      t.text = s
+                      t.textSize = size
+                      t.setPadding(0, 20, 0, 8)
+                      box.addView(t)
+                      return t
+                  }
+                  fun button(s: String, action: () -> Unit) {
+                      val b = Button(this)
+                      b.text = s
+                      b.setOnClickListener { action() }
+                      box.addView(b)
+                  }
+                  fun field(hint: String, value: String): EditText {
+                      val e = EditText(this)
+                      e.hint = hint
+                      e.setText(value)
+                      e.setSingleLine(true)
+                      box.addView(e)
+                      return e
+                  }
+
+                  label("GROOT", 30f)
+                  label("Say \"Hey Groot\" and then your command. Example: Hey Groot, open YouTube.\nDo the steps below in order.")
+                  status = label("")
+
+                  button("1. Allow permissions") {
+                      val p = mutableListOf(
+                          Manifest.permission.RECORD_AUDIO,
+                          Manifest.permission.READ_CONTACTS,
+                          Manifest.permission.CALL_PHONE
+                      )
+                      if (Build.VERSION.SDK_INT >= 33) p.add("android.permission.POST_NOTIFICATIONS")
+                      requestPermissions(p.toTypedArray(), 1)
+                  }
+
+                  label("2. Android 13+ blocks apps installed from outside the Play Store. Open App info, tap the three dots at the top right, and choose \"Allow restricted settings\".")
+                  button("2. Open App info") {
+                      startActivity(
+                          Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:$packageName"))
+                      )
+                  }
+
+                  button("3. Open Accessibility settings (turn Groot ON)") {
+                      startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+                  }
+
+                  label("4. Optional AI brain (free key from aistudio.google.com). It lets Groot understand long sentences and do multi-step tasks.")
+                  val keyBox = field("Gemini API key", prefs.getString("key", "") ?: "")
+                  val modelBox = field("Model name", prefs.getString("model", Brain.DEFAULT_MODEL) ?: Brain.DEFAULT_MODEL)
+                  button("4. Save AI settings") {
+                      prefs.edit()
+                          .putString("key", keyBox.text.toString().trim())
+                          .putString("model", modelBox.text.toString().trim())
+                          .apply()
+                      toast("Saved")
+                  }
+
+                  button("5. Start Groot") {
+                      if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+                          toast("Allow permissions first (step 1)")
+                      } else {
+                          startForegroundService(Intent(this, WakeService::class.java))
+                          toast("Groot is listening. Say: Hey Groot")
+                      }
+                  }
+                  button("Stop Groot") {
+                      stopService(Intent(this, WakeService::class.java))
+                      toast("Groot stopped")
+                  }
+
+                  setContentView(ScrollView(this).apply { addView(box) })
+              }
+
+              override fun onResume() {
+                  super.onResume()
+                  val mic = checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
+                  status.text = "Microphone: " + (if (mic) "OK" else "not allowed yet") +
+                      "\nAccessibility: " + (if (GrootAccess.instance != null) "ON" else "OFF")
+              }
+
+              private fun toast(s: String) = Toast.makeText(this, s, Toast.LENGTH_SHORT).show()
+          }
+          GROOT_EOF
+          cat > app/src/main/java/com/groot/app/GrootAccess.kt << 'GROOT_EOF'
+          package com.groot.app
+
+          import android.accessibilityservice.AccessibilityService
+          import android.accessibilityservice.GestureDescription
+          import android.content.Intent
+          import android.graphics.Path
+          import android.graphics.Rect
+          import android.os.Build
+          import android.os.Bundle
+          import android.view.accessibility.AccessibilityEvent
+          import android.view.accessibility.AccessibilityNodeInfo
+
+          /** Groot's hands: taps, scrolls, types and presses buttons in any app. */
+          class GrootAccess : AccessibilityService() {
+
+              companion object {
+                  @Volatile
+                  var instance: GrootAccess? = null
+              }
+
+              override fun onServiceConnected() { instance = this }
+              override fun onUnbind(intent: Intent?): Boolean { instance = null; return super.onUnbind(intent) }
+              override fun onDestroy() { instance = null; super.onDestroy() }
+              override fun onAccessibilityEvent(event: AccessibilityEvent?) {}
+              override fun onInterrupt() {}
+
+              // ---- system buttons ----
+              fun global(name: String): Boolean = when (name) {
+                  "home" -> performGlobalAction(GLOBAL_ACTION_HOME)
+                  "back" -> performGlobalAction(GLOBAL_ACTION_BACK)
+                  "recents" -> performGlobalAction(GLOBAL_ACTION_RECENTS)
+                  "notifications" -> performGlobalAction(GLOBAL_ACTION_NOTIFICATIONS)
+                  "quicksettings" -> performGlobalAction(GLOBAL_ACTION_QUICK_SETTINGS)
+                  "lock" -> if (Build.VERSION.SDK_INT >= 28) performGlobalAction(GLOBAL_ACTION_LOCK_SCREEN) else false
+                  "screenshot" -> if (Build.VERSION.SDK_INT >= 28) performGlobalAction(GLOBAL_ACTION_TAKE_SCREENSHOT) else false
+                  else -> false
+              }
+
+              // ---- reading the screen ----
+              private fun allNodes(): List<AccessibilityNodeInfo> {
+                  val out = ArrayList<AccessibilityNodeInfo>()
+                  fun walk(n: AccessibilityNodeInfo?, depth: Int) {
+                      if (n == null || depth > 40 || out.size > 600) return
+                      out.add(n)
+                      for (i in 0 until n.childCount) walk(n.getChild(i), depth + 1)
+                  }
+                  walk(rootInActiveWindow, 0)
+                  return out
+              }
+
+              private fun label(n: AccessibilityNodeInfo): String =
+                  (n.text?.toString() ?: n.contentDescription?.toString() ?: "").trim()
+
+              /** A short text description of the screen, sent to the AI brain. */
+              fun screenText(): String {
+                  val sb = StringBuilder("App: ${rootInActiveWindow?.packageName}\n")
+                  var count = 0
+                  var last = ""
+                  for (n in allNodes()) {
+                      if (!n.isVisibleToUser) continue
+                      val l = label(n).replace("\n", " ")
+                      if (l.isEmpty() && !n.isEditable) continue
+                      val kind = when {
+                          n.isEditable -> " [input]"
+                          n.isClickable -> " [tap]"
+                          else -> ""
+                      }
+                      val line = "- \"${l.take(50)}\"$kind"
+                      if (line == last) continue
+                      last = line
+                      sb.append(line).append('\n')
+                      if (++count >= 60) break
+                  }
+                  return sb.toString()
+              }
+
+              // ---- touch ----
+              fun gesture(x1: Float, y1: Float, x2: Float, y2: Float, ms: Long): Boolean {
+                  val p = Path().apply {
+                      moveTo(x1, y1)
+                      if (x1 != x2 || y1 != y2) lineTo(x2, y2)
+                  }
+                  val g = GestureDescription.Builder()
+                      .addStroke(GestureDescription.StrokeDescription(p, 0, ms))
+                      .build()
+                  return dispatchGesture(g, null, null)
+              }
+
+              fun tapText(target: String, long: Boolean = false): Boolean {
+                  val t = target.lowercase().trim()
+                  if (t.isEmpty()) return false
+                  val nodes = allNodes().filter { it.isVisibleToUser && label(it).lowercase().contains(t) }
+                  val n = nodes.firstOrNull { label(it).lowercase() == t }
+                      ?: nodes.minByOrNull { label(it).length }
+                      ?: return false
+                  if (!long) {
+                      var c: AccessibilityNodeInfo? = n
+                      while (c != null && !c.isClickable) c = c.parent
+                      if (c != null && c.performAction(AccessibilityNodeInfo.ACTION_CLICK)) return true
+                  }
+                  val r = Rect()
+                  n.getBoundsInScreen(r)
+                  val x = r.centerX().toFloat()
+                  val y = r.centerY().toFloat()
+                  return gesture(x, y, x, y, if (long) 800 else 50)
+              }
+
+              fun swipe(dir: String): Boolean {
+                  val m = resources.displayMetrics
+                  val w = m.widthPixels.toFloat()
+                  val h = m.heightPixels.toFloat()
+                  return when (dir.trim()) {
+                      "up" -> gesture(w / 2, h * 0.7f, w / 2, h * 0.3f, 300)
+                      "down" -> gesture(w / 2, h * 0.3f, w / 2, h * 0.7f, 300)
+                      "left" -> gesture(w * 0.8f, h / 2, w * 0.2f, h / 2, 300)
+                      "right" -> gesture(w * 0.2f, h / 2, w * 0.8f, h / 2, 300)
+                      else -> false
+                  }
+              }
+
+              /** "scroll down" moves the finger up, like a person would. */
+              fun scroll(down: Boolean): Boolean = swipe(if (down) "up" else "down")
+
+              // ---- typing ----
+              fun typeText(text: String): Boolean {
+                  val n = rootInActiveWindow?.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
+                      ?: allNodes().firstOrNull { it.isEditable && it.isVisibleToUser }
+                      ?: return false
+                  val old = if (n.isShowingHintText) "" else (n.text?.toString() ?: "")
+                  val args = Bundle().apply {
+                      putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, old + text)
+                  }
+                  return n.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
+              }
+
+              fun enter(): Boolean {
+                  val n = rootInActiveWindow?.findFocus(AccessibilityNodeInfo.FOCUS_INPUT) ?: return false
+                  return if (Build.VERSION.SDK_INT >= 30)
+                      n.performAction(AccessibilityNodeInfo.AccessibilityAction.ACTION_IME_ENTER.id)
+                  else false
+              }
+          }
+          GROOT_EOF
+          cat > app/src/main/java/com/groot/app/Brain.kt << 'GROOT_EOF'
+          package com.groot.app
+
+          import android.Manifest
+          import android.content.Context
+          import android.content.Intent
+          import android.content.pm.PackageManager
+          import android.hardware.camera2.CameraManager
+          import android.media.AudioManager
+          import android.net.Uri
+          import android.provider.ContactsContract
+          import org.json.JSONArray
+          import org.json.JSONObject
+          import java.net.HttpURLConnection
+          import java.net.URL
+          import java.text.SimpleDateFormat
+          import java.util.Date
+          import java.util.Locale
+
+          /**
+           * Groot's brain. Simple sentences run instantly with no AI.
+           * Anything else goes to the AI, which looks at the screen and
+           * picks the next commands, step by step, until the goal is done.
+           */
+          class Brain(private val app: Context, private val say: (String) -> Unit) {
+
+              companion object {
+                  const val DEFAULT_MODEL = "gemini-3.8-flash"
+              }
+
+              private val prefs = app.getSharedPreferences("groot", Context.MODE_PRIVATE)
+              private val ctx: Context get() = GrootAccess.instance ?: app
+
+              private val accessCommands = setOf(
+                  "tap", "click", "longpress", "type", "enter", "scroll", "swipe",
+                  "back", "home", "recents", "notifications", "quicksettings", "lock", "screenshot"
+              )
+
+              fun handle(utterance: String) {
+                  val quick = local(utterance)
+                  if (quick != null) {
+                      for (c in quick) exec(c)
+                      return
+                  }
+                  agent(utterance)
+              }
+
+              // ---------- instant commands (no AI needed) ----------
+              private fun local(u: String): List<String>? {
+                  val s = u.lowercase(Locale.getDefault()).trim().trimEnd('.', '!', '?')
+                  return when {
+                      s == "stop" || s == "cancel" -> emptyList()
+                      s == "go back" || s == "back" -> listOf("back")
+                      s == "go home" || s == "home" -> listOf("home")
+                      s.contains("recent apps") || s == "recents" -> listOf("recents")
+                      s.contains("notification") -> listOf("notifications")
+                      s.contains("quick settings") -> listOf("quicksettings")
+                      s.contains("screenshot") -> listOf("screenshot")
+                      s.startsWith("lock") -> listOf("lock")
+                      s.startsWith("scroll down") -> listOf("scroll down")
+                      s.startsWith("scroll up") -> listOf("scroll up")
+                      s.startsWith("swipe ") -> listOf(s)
+                      s.startsWith("open ") -> listOf(s)
+                      s.startsWith("tap ") || s.startsWith("click ") -> listOf("tap " + s.substringAfter(" "))
+                      s.startsWith("long press ") -> listOf("longpress " + s.removePrefix("long press "))
+                      s.startsWith("call ") -> listOf(s)
+                      s.startsWith("search ") -> listOf(s)
+                      s.startsWith("type ") -> listOf("type " + u.trim().substringAfter(" "))
+                      s == "enter" || s == "press enter" -> listOf("enter")
+                      s.startsWith("volume up") || s.startsWith("volume down") || s == "mute" -> listOf(if (s == "mute") "volume mute" else s)
+                      s.contains("torch") || s.contains("flashlight") -> listOf("torch " + if (s.contains("off")) "off" else "on")
+                      s.contains("what time") -> listOf("say " + SimpleDateFormat("h:mm a", Locale.getDefault()).format(Date()))
+                      else -> null
+                  }
+              }
+
+              // ---------- AI agent loop ----------
+              private fun agent(goal: String) {
+                  val key = prefs.getString("key", "") ?: ""
+                  if (key.isBlank()) {
+                      say("I need an AI key for that. Add it in the Groot app.")
+                      return
+                  }
+                  val history = StringBuilder()
+                  repeat(10) {
+                      val screen = GrootAccess.instance?.screenText() ?: "(accessibility is off)"
+                      val reply = askGemini(prompt(goal, screen, history.toString())) ?: return
+                      var finished = false
+                      for (raw in reply.lines()) {
+                          val line = raw.trim().trim('`', '-', '*', ' ')
+                          if (line.isEmpty()) continue
+                          history.append(line).append('\n')
+                          if (!exec(line)) { finished = true; break }
+                          Thread.sleep(600)
+                      }
+                      if (finished) return
+                      Thread.sleep(1200)
+                  }
+                  say("I stopped after ten steps")
+              }
+
+              private fun prompt(goal: String, screen: String, history: String) = """
+          You control an Android phone for the user. The user's goal: "$goal"
+          Reply with 1 to 3 commands, one per line, with no explanations and no markdown. Commands:
+          open <app name>
+          tap <visible text>
+          longpress <visible text>
+          type <text>
+          enter
+          scroll down
+          scroll up
+          swipe left
+          swipe right
+          back
+          home
+          recents
+          notifications
+          quicksettings
+          call <contact name or number>
+          search <web query>
+          volume up
+          volume down
+          torch on
+          torch off
+          wait <seconds>
+          say <short spoken reply>
+          done
+          Use "say" to answer a question, then "done". Use "done" when the goal is finished.
+          Only tap text that appears on the current screen. If the app you need is not open, use "open".
+          Commands already run:
+          ${history.ifBlank { "(none)" }}
+          Current screen:
+          $screen
+          """.trimIndent()
+
+              private fun askGemini(prompt: String): String? {
+                  return try {
+                      val model = (prefs.getString("model", DEFAULT_MODEL) ?: DEFAULT_MODEL).ifBlank { DEFAULT_MODEL }
+                      val c = URL("https://generativelanguage.googleapis.com/v1beta/models/$model:generateContent")
+                          .openConnection() as HttpURLConnection
+                      c.requestMethod = "POST"
+                      c.setRequestProperty("Content-Type", "application/json")
+                      c.setRequestProperty("x-goog-api-key", prefs.getString("key", "") ?: "")
+                      c.doOutput = true
+                      c.connectTimeout = 15000
+                      c.readTimeout = 40000
+                      val body = JSONObject().put(
+                          "contents",
+                          JSONArray().put(JSONObject().put("parts", JSONArray().put(JSONObject().put("text", prompt))))
+                      )
+                      c.outputStream.use { it.write(body.toString().toByteArray()) }
+                      val code = c.responseCode
+                      val text = (if (code in 200..299) c.inputStream else c.errorStream).bufferedReader().readText()
+                      if (code !in 200..299) {
+                          say("AI error $code")
+                          return null
+                      }
+                      val parts = JSONObject(text).getJSONArray("candidates").getJSONObject(0)
+                          .getJSONObject("content").getJSONArray("parts")
+                      buildString { for (i in 0 until parts.length()) append(parts.getJSONObject(i).optString("text")) }
+                  } catch (e: Exception) {
+                      say("I could not reach the AI")
+                      null
+                  }
+              }
+
+              // ---------- run one command; returns false when finished ----------
+              fun exec(line: String): Boolean {
+                  val i = line.indexOf(' ')
+                  val cmd = (if (i < 0) line else line.substring(0, i)).lowercase(Locale.getDefault())
+                  val arg = if (i < 0) "" else line.substring(i + 1).trim()
+                  val acc = GrootAccess.instance
+
+                  if (acc == null && cmd in accessCommands) {
+                      say("Please turn on Groot in Accessibility settings")
+                      return true
+                  }
+
+                  when (cmd) {
+                      "done" -> return false
+                      "say" -> say(arg)
+                      "wait" -> Thread.sleep(((arg.toDoubleOrNull() ?: 1.0).coerceIn(0.0, 10.0) * 1000).toLong())
+                      "open" -> openApp(arg)
+                      "call" -> call(arg)
+                      "search" -> launch(Intent(Intent.ACTION_VIEW, Uri.parse("https://www.google.com/search?q=" + Uri.encode(arg))))
+                      "volume" -> volume(arg)
+                      "torch" -> torch(arg != "off")
+                      "tap", "click" -> if (acc?.tapText(arg) != true) say("I can't see $arg")
+                      "longpress" -> if (acc?.tapText(arg, true) != true) say("I can't see $arg")
+                      "type" -> if (acc?.typeText(arg) != true) say("I can't find a text box")
+                      "enter" -> acc?.enter()
+                      "scroll" -> acc?.scroll(arg.startsWith("down"))
+                      "swipe" -> acc?.swipe(arg)
+                      "back", "home", "recents", "notifications", "quicksettings", "lock", "screenshot" -> acc?.global(cmd)
+                      else -> {}
+                  }
+                  return true
+              }
+
+              // ---------- phone features ----------
+              private fun launch(i: Intent) {
+                  i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                  try { ctx.startActivity(i) } catch (e: Exception) { say("I can't do that on this phone") }
+              }
+
+              private fun openApp(name: String) {
+                  val pm = app.packageManager
+                  val q = name.lowercase(Locale.getDefault()).trim()
+                  val apps = pm.queryIntentActivities(Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER), 0)
+                  val hit = apps.firstOrNull { it.loadLabel(pm).toString().lowercase(Locale.getDefault()) == q }
+                      ?: apps.firstOrNull { it.loadLabel(pm).toString().lowercase(Locale.getDefault()).contains(q) }
+                  val intent = hit?.let { pm.getLaunchIntentForPackage(it.activityInfo.packageName) }
+                  if (intent == null) say("I can't find $name") else launch(intent)
+              }
+
+              private fun granted(p: String) = app.checkSelfPermission(p) == PackageManager.PERMISSION_GRANTED
+
+              private fun findContact(name: String): String? {
+                  if (!granted(Manifest.permission.READ_CONTACTS)) return null
+                  val c = app.contentResolver.query(
+                      ContactsContract.CommonDataKinds.Phone.CONTENT_URI,
+                      arrayOf(ContactsContract.CommonDataKinds.Phone.NUMBER),
+                      ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME + " LIKE ?",
+                      arrayOf("%$name%"), null
+                  )
+                  c?.use { if (it.moveToFirst()) return it.getString(0) }
+                  return null
+              }
+
+              private fun call(arg: String) {
+                  var number = arg.replace(" ", "")
+                  if (!number.matches(Regex("[+0-9]+"))) {
+                      number = findContact(arg) ?: run { say("I can't find $arg in your contacts"); return }
+                  }
+                  val action = if (granted(Manifest.permission.CALL_PHONE)) Intent.ACTION_CALL else Intent.ACTION_DIAL
+                  launch(Intent(action, Uri.parse("tel:" + Uri.encode(number))))
+              }
+
+              private fun volume(arg: String) {
+                  val am = ctx.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+                  val dir = when {
+                      arg.startsWith("up") -> AudioManager.ADJUST_RAISE
+                      arg.startsWith("down") -> AudioManager.ADJUST_LOWER
+                      else -> AudioManager.ADJUST_MUTE
+                  }
+                  am.adjustStreamVolume(AudioManager.STREAM_MUSIC, dir, AudioManager.FLAG_SHOW_UI)
+              }
+
+              private fun torch(on: Boolean) {
+                  try {
+                      val cm = ctx.getSystemService(Context.CAMERA_SERVICE) as CameraManager
+                      cm.setTorchMode(cm.cameraIdList[0], on)
+                  } catch (e: Exception) {
+                      say("The torch is not available")
+                  }
+              }
+          }
+          GROOT_EOF
+          cat > app/src/main/java/com/groot/app/WakeService.kt << 'GROOT_EOF'
+          package com.groot.app
+
+          import android.app.Notification
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.Service
+          import android.content.Intent
+          import android.content.pm.ServiceInfo
+          import android.media.AudioManager
+          import android.media.ToneGenerator
+          import android.os.Build
+          import android.os.Bundle
+          import android.os.Handler
+          import android.os.IBinder
+          import android.os.Looper
+          import android.speech.RecognitionListener
+          import android.speech.RecognizerIntent
+          import android.speech.SpeechRecognizer
+          import android.speech.tts.TextToSpeech
+          import java.util.Locale
+          import java.util.concurrent.Executors
+
+          /** Groot's ears: always listening for "Hey Groot", then runs the command. */
+          class WakeService : Service() {
+
+              private val handler = Handler(Looper.getMainLooper())
+              private val pool = Executors.newSingleThreadExecutor()
+              private var recognizer: SpeechRecognizer? = null
+              private var tts: TextToSpeech? = null
+              private var ttsReady = false
+              private lateinit var brain: Brain
+
+              @Volatile private var busy = false
+              private var commandMode = false
+              private var active = true
+
+              // "hey groot" plus the ways speech recognition often mishears it
+              private val wake = Regex("""\b(?:(?:hey|hay|hi|ok|okay|a)\s+(?:groot|grut|root|grewt|grood|gruit|grew|growth)|groot)\b""")
+
+              private val listenIntent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+                  putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+                  putExtra(RecognizerIntent.EXTRA_LANGUAGE, Locale.getDefault().toLanguageTag())
+                  putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 3)
+                  putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, true)
+              }
+
+              private val listener = object : RecognitionListener {
+                  override fun onResults(b: Bundle?) {
+                      val list = b?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION).orEmpty()
+                      if (commandMode) {
+                          commandMode = false
+                          val t = list.firstOrNull().orEmpty().trim()
+                          if (t.isNotEmpty()) dispatch(t) else startListen()
+                          return
+                      }
+                      for (alt in list) {
+                          val m = wake.find(alt.lowercase()) ?: continue
+                          val rest = alt.substring(minOf(m.range.last + 1, alt.length)).trim()
+                          if (rest.isNotEmpty()) {
+                              dispatch(rest)
+                          } else {
+                              beep()
+                              commandMode = true
+                              handler.postDelayed({ startListen() }, 350)
+                          }
+                          return
+                      }
+                      startListen()
+                  }
+
+                  override fun onError(error: Int) {
+                      commandMode = false
+                      if (error == SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS) {
+                          stopSelf()
+                          return
+                      }
+                      val delay = if (error == SpeechRecognizer.ERROR_NO_MATCH ||
+                          error == SpeechRecognizer.ERROR_SPEECH_TIMEOUT) 100L else 800L
+                      handler.postDelayed({ startListen() }, delay)
+                  }
+
+                  override fun onReadyForSpeech(p: Bundle?) {}
+                  override fun onBeginningOfSpeech() {}
+                  override fun onRmsChanged(v: Float) {}
+                  override fun onBufferReceived(b: ByteArray?) {}
+                  override fun onEndOfSpeech() {}
+                  override fun onPartialResults(p: Bundle?) {}
+                  override fun onEvent(t: Int, p: Bundle?) {}
+              }
+
+              override fun onCreate() {
+                  super.onCreate()
+                  try {
+                      startAsForeground()
+                  } catch (e: Exception) {
+                      stopSelf()
+                      return
+                  }
+                  tts = TextToSpeech(this) { status ->
+                      if (status == TextToSpeech.SUCCESS) {
+                          tts?.language = Locale.getDefault()
+                          ttsReady = true
+                      }
+                  }
+                  brain = Brain(applicationContext) { speak(it) }
+                  recognizer = SpeechRecognizer.createSpeechRecognizer(this).also {
+                      it.setRecognitionListener(listener)
+                  }
+                  startListen()
+              }
+
+              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int) = START_STICKY
+
+              override fun onBind(intent: Intent?): IBinder? = null
+
+              override fun onDestroy() {
+                  active = false
+                  handler.removeCallbacksAndMessages(null)
+                  recognizer?.destroy()
+                  tts?.shutdown()
+                  pool.shutdownNow()
+                  super.onDestroy()
+              }
+
+              private fun startAsForeground() {
+                  val nm = getSystemService(NotificationManager::class.java)
+                  nm.createNotificationChannel(
+                      NotificationChannel("groot", "Groot", NotificationManager.IMPORTANCE_LOW)
+                  )
+                  val n = Notification.Builder(this, "groot")
+                      .setContentTitle("Groot is listening")
+                      .setContentText("Say \"Hey Groot\" and then your command")
+                      .setSmallIcon(android.R.drawable.ic_btn_speak_now)
+                      .build()
+                  if (Build.VERSION.SDK_INT >= 29) {
+                      startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE)
+                  } else {
+                      startForeground(1, n)
+                  }
+              }
+
+              private fun startListen() {
+                  if (!active || busy) return
+                  try {
+                      recognizer?.cancel()
+                      recognizer?.startListening(listenIntent)
+                  } catch (e: Exception) {
+                      handler.postDelayed({ startListen() }, 1000)
+                  }
+              }
+
+              private fun dispatch(text: String) {
+                  busy = true
+                  recognizer?.cancel()
+                  pool.execute {
+                      try {
+                          brain.handle(text)
+                      } catch (e: Exception) {
+                          speak("Something went wrong")
+                      }
+                      Thread.sleep(400)
+                      while (tts?.isSpeaking == true) Thread.sleep(100)
+                      handler.post {
+                          busy = false
+                          startListen()
+                      }
+                  }
+              }
+
+              private fun speak(text: String) {
+                  if (ttsReady) tts?.speak(text, TextToSpeech.QUEUE_ADD, null, "groot")
+              }
+
+              private fun beep() {
+                  try {
+                      ToneGenerator(AudioManager.STREAM_MUSIC, 80).startTone(ToneGenerator.TONE_PROP_BEEP, 150)
+                  } catch (e: Exception) {
+                  }
+              }
+          }
+          GROOT_EOF
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - name: Accept Android licenses
+        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.9
+      - name: Build debug APK
+        run: gradle assembleDebug --no-daemon --stacktrace
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Groot-APK
+          path: app/build/outputs/apk/debug/app-debug.apk
